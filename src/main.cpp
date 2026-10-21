@@ -1,107 +1,120 @@
 #include <Arduino.h>
 #include "Config.h"
 #include "Led.h"
-#include "Button.h"
-#include "LoopProfiler.h"
 
-// «Класичний Blink», переписаний в стилі Embedded C++:
-//  - enum class для станів, static constexpr замість магічних чисел;
-//  - жодного delay(): неблокуючий superloop на millis();
-//  - без динамічної пам'яті та STL-контейнерів;
-//  - кнопка через переривання перемикає режим: Блимання -> Увімкнено -> Вимкнено -> Блимання.
-
-namespace
+// Режими роботи LED, які перемикає кнопка
+enum class LedMode
 {
-
-enum class LedMode : uint8_t
-{
-    Blink,
-    AlwaysOn,
-    AlwaysOff
+    Blink,     // блимання
+    AlwaysOn,  // постійно увімкнено
+    AlwaysOff  // постійно вимкнено
 };
 
-const char *toString(LedMode mode)
+// Глобальні змінні — лише необхідні для стану та переривання
+Led led(Config::LED_PIN);
+LedMode mode = LedMode::Blink;
+volatile bool buttonPressed = false; // volatile — бо змінюється в перериванні (ISR)
+
+// Обробник переривання: мінімальний — лише ставимо прапорець
+void IRAM_ATTR buttonISR()
 {
-    switch (mode)
-    {
-    case LedMode::Blink:     return "Blink";
-    case LedMode::AlwaysOn:  return "Always ON";
-    case LedMode::AlwaysOff: return "Always OFF";
-    }
-    return "?";
+    buttonPressed = true;
 }
 
-LedMode next(LedMode mode)
+// Перемкнути режим по колу: Блимання -> Увімкнено -> Вимкнено -> Блимання
+void nextMode()
 {
-    switch (mode)
+    if (mode == LedMode::Blink)
     {
-    case LedMode::Blink:     return LedMode::AlwaysOn;
-    case LedMode::AlwaysOn:  return LedMode::AlwaysOff;
-    case LedMode::AlwaysOff: return LedMode::Blink;
+        mode = LedMode::AlwaysOn;
+        led.set(LedState::On);
+        Serial.println("Mode: Always ON");
     }
-    return LedMode::Blink;
+    else if (mode == LedMode::AlwaysOn)
+    {
+        mode = LedMode::AlwaysOff;
+        led.set(LedState::Off);
+        Serial.println("Mode: Always OFF");
+    }
+    else
+    {
+        mode = LedMode::Blink;
+        Serial.println("Mode: Blink");
+    }
 }
 
-// Увесь стан програми зібрано в одному об'єкті замість набору глобальних змінних
-class App
+// Обробка кнопки з антидребезгом
+void handleButton()
 {
-public:
-    void setup()
+    // static — змінна зберігає значення між викликами функції
+    static u32_t lastTimeButtonDown = 0; // коли кнопка востаннє була натиснута (LOW)
+
+    u32_t now = millis();
+
+    if (buttonPressed)
     {
-        Serial.begin(Config::kSerialBaud);
-        led_.init();
-        button_.init();
-        Serial.printf("Ready. Mode: %s\n", toString(mode_));
-    }
+        buttonPressed = false;
 
-    void loop()
-    {
-        profiler_.tick(micros());
-        const uint32_t now = millis();
-
-        if (button_.poll(now))
+        // Натискання справжнє, лише якщо перед ним кнопка була відпущена довше за DEBOUNCE_MS.
+        // Брязкіт при натисканні і при відпусканні йде, поки кнопка ще "натиснута", тому відсікається.
+        if (now - lastTimeButtonDown > Config::DEBOUNCE_MS)
         {
-            mode_ = next(mode_);
-            lastToggleMs_ = now;
-            Serial.printf("Button -> mode: %s\n", toString(mode_));
-
-            // Постійні режими достатньо застосувати один раз — при перемиканні
-            if (mode_ == LedMode::AlwaysOn)
-            {
-                led_.set(LedState::On);
-            }
-            else if (mode_ == LedMode::AlwaysOff)
-            {
-                led_.set(LedState::Off);
-            }
-        }
-
-        if (mode_ == LedMode::Blink && now - lastToggleMs_ >= Config::kBlinkIntervalMs)
-        {
-            lastToggleMs_ = now;
-            led_.toggle();
+            nextMode();
         }
     }
 
-private:
-    Led led_{Config::kLedPin};
-    Button button_{Config::kButtonPin};
-    LoopProfiler profiler_{Config::kProfileEveryIterations};
+    if (digitalRead(Config::BUTTON_PIN) == LOW)
+    {
+        lastTimeButtonDown = now;
+    }
+}
 
-    LedMode mode_ = LedMode::Blink;
-    uint32_t lastToggleMs_ = 0;
-};
+// Неблокуюче блимання без delay()
+void handleBlink()
+{
+    static u32_t lastBlinkTime = 0;
 
-App app; // єдиний об'єкт на рівні файлу; anonymous namespace — не видно з інших файлів
+    if (mode == LedMode::Blink && millis() - lastBlinkTime >= Config::BLINK_INTERVAL_MS)
+    {
+        lastBlinkTime = millis();
+        led.toggle();
+    }
+}
 
-} // namespace
+// Вимірювання часу однієї ітерації loop()
+void measureLoopTime(u32_t loopStartUs)
+{
+    static u32_t loopCount = 0;
+    static u32_t totalTimeUs = 0;
+
+    totalTimeUs += micros() - loopStartUs;
+    loopCount++;
+
+    if (loopCount >= Config::LOOPS_TO_MEASURE)
+    {
+        Serial.printf("Average loop time: %u us\n", totalTimeUs / loopCount);
+        loopCount = 0;
+        totalTimeUs = 0;
+    }
+}
 
 void setup()
 {
-    app.setup();
+    Serial.begin(Config::SERIAL_SPEED);
+    led.init();
+
+    pinMode(Config::BUTTON_PIN, INPUT_PULLUP); // відпущена = HIGH, натиснута = LOW
+    attachInterrupt(digitalPinToInterrupt(Config::BUTTON_PIN), buttonISR, FALLING);
+
+    Serial.println("Ready. Mode: Blink");
 }
 
-void loop()
+void loop() // superloop: кожна функція робить короткий крок і не блокує інші
 {
-    app.loop();
+    u32_t loopStartUs = micros();
+
+    handleButton();
+    handleBlink();
+
+    measureLoopTime(loopStartUs);
 }

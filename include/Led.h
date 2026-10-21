@@ -1,9 +1,9 @@
 #pragma once
 
-#include <cstdint>
+#include <Arduino.h>
 
-// Стан світлодіода: типобезпечно, не змішується з int чи bool
-enum class LedState : uint8_t
+// Стан світлодіода
+enum class LedState
 {
     Off,
     On
@@ -11,15 +11,14 @@ enum class LedState : uint8_t
 
 class Led
 {
+private:
+    u8_t pin;
+    LedState state = LedState::Off;
+
 public:
-    explicit constexpr Led(uint8_t pin) : pin_(pin) {}
+    Led(u8_t ledPin) { pin = ledPin; }
 
     void init();
-    void set(LedState state);
-    void toggle();
-    LedState state() const { return state_; }
-
-private:
-    const uint8_t pin_;
-    LedState state_ = LedState::Off;
+    void set(LedState newState);
+    void toggle(); // перемкнути: On -> Off, Off -> On
 };

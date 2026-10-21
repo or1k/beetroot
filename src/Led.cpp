@@ -1,19 +1,33 @@
 #include "Led.h"
-#include <Arduino.h>
 
 void Led::init()
 {
-    pinMode(pin_, OUTPUT);
+    pinMode(pin, OUTPUT); // налаштовуємо пін на ВИХІД
     set(LedState::Off);
 }
 
-void Led::set(LedState state)
+void Led::set(LedState newState)
 {
-    state_ = state;
-    digitalWrite(pin_, state_ == LedState::On ? HIGH : LOW);
+    state = newState;
+
+    if (state == LedState::On)
+    {
+        digitalWrite(pin, HIGH);
+    }
+    else
+    {
+        digitalWrite(pin, LOW);
+    }
 }
 
 void Led::toggle()
 {
-    set(state_ == LedState::On ? LedState::Off : LedState::On);
+    if (state == LedState::On)
+    {
+        set(LedState::Off);
+    }
+    else
+    {
+        set(LedState::On);
+    }
 }

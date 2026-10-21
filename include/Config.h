@@ -1,21 +1,17 @@
 #pragma once
 
-#include <cstdint>
+#include <Arduino.h>
 
-// Усі налаштування проєкту в одному місці — жодних «магічних чисел» у коді.
-// static constexpr: значення відомі на етапі компіляції, не займають RAM
-// і не можуть бути випадково змінені під час роботи.
+// Усі налаштування в одному місці — жодних "магічних чисел" у коді.
+// static constexpr — константа, відома ще під час компіляції.
 struct Config
 {
-    // ---------- Піни ----------
-    static constexpr uint8_t kLedPin = 18;    // LED через резистор 220 Ом на GND
-    static constexpr uint8_t kButtonPin = 17; // кнопка між GPIO17 і GND, внутрішня підтяжка
+    static constexpr u8_t LED_PIN = 18;    // LED через резистор 220 Ом на GND
+    static constexpr u8_t BUTTON_PIN = 17; // кнопка між GPIO17 і GND
 
-    // ---------- Таймінги ----------
-    static constexpr uint32_t kBlinkIntervalMs = 500; // півперіод блимання (1 Гц)
-    static constexpr uint32_t kDebounceMs = 50;       // антидребезг кнопки
+    static constexpr u32_t BLINK_INTERVAL_MS = 500; // LED горить 500 мс і не горить 500 мс
+    static constexpr u32_t DEBOUNCE_MS = 50;        // захист від брязкоту кнопки
 
-    // ---------- Serial ----------
-    static constexpr uint32_t kSerialBaud = 115200;
-    static constexpr uint32_t kProfileEveryIterations = 1000; // звіт про час loop()
+    static constexpr u32_t SERIAL_SPEED = 115200;
+    static constexpr u32_t LOOPS_TO_MEASURE = 1000; // раз на скільки ітерацій друкувати час loop()
 };

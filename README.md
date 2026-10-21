@@ -11,32 +11,33 @@ PlatformIO-проєкт для ESP32-S3 DevKitC-1 (Arduino framework).
 | LED | GPIO18 → резистор 220 Ом → LED → GND |
 | Кнопка | GPIO17 ↔ кнопка ↔ GND (внутрішня підтяжка `INPUT_PULLUP`) |
 
+### Файли
+- [include/Config.h](include/Config.h) — структура `Config` зі `static constexpr` константами (піни, інтервали);
+- [include/Led.h](include/Led.h), [src/Led.cpp](src/Led.cpp) — `enum class LedState` і клас `Led` з `init()` та `set()`;
+- [src/main.cpp](src/main.cpp) — superloop: кнопка, блимання, вимірювання часу `loop()`.
+
 ### Що реалізовано
-1. **Blink в Embedded C++**
-   - `enum class LedState { Off, On }` — стан світлодіода;
-   - клас `Led` з методами `init()` і `set(LedState)` ([include/Led.h](include/Led.h));
-   - без `delay()`: неблокуючий superloop на `millis()`;
-   - без глобальних змінних: увесь стан у класі `App` в anonymous namespace ([src/main.cpp](src/main.cpp)).
-2. **static constexpr замість магічних чисел** — структура `Config` ([include/Config.h](include/Config.h)): піни, інтервал блимання, антидребезг, швидкість Serial.
-3. **Вимірювання часу superloop** — `LoopProfiler` раз на 1000 ітерацій друкує середній, мінімальний і максимальний час однієї ітерації `loop()`.
-4. **Кнопка через переривання**
-   - `attachInterrupt(..., FALLING)`; ISR лише ставить `static volatile bool` прапорець;
-   - антидребезг і перемикання режимів — у `loop()`: натискання приймається, лише якщо кнопка перед цим була стабільно відпущена 50 мс;
-   - режими по колу: **Блимання → Постійно увімкнено → Постійно вимкнено → Блимання**.
+1. **Blink без `delay()`** — блимання через `millis()`, `loop()` ніколи не зупиняється.
+2. **Без магічних чисел** — усі числа винесені в `Config`.
+3. **Час виконання `loop()`** — раз на 1000 ітерацій у Serial друкується середній час однієї ітерації.
+4. **Кнопка через переривання** — ISR лише ставить прапорець `volatile bool buttonPressed`.
+   Антидребезг і перемикання режимів — у `loop()`.
+   Режими по колу: **Блимання → Постійно увімкнено → Постійно вимкнено → Блимання**.
 
 ### Концепції
-- `volatile` — прапорець, який змінює ISR;
-- `const` / `constexpr` / `static` — конфігурація, піни, константи класів;
-- без динамічної пам'яті (`new`, `malloc`) і STL-контейнерів;
-- superloop-архітектура: кожна задача — короткий неблокуючий крок у `loop()`.
+- `volatile` — змінна, яку змінює переривання;
+- `static constexpr` — константи конфігурації;
+- `static` у функціях — змінні, що зберігають значення між викликами (замість зайвих глобальних);
+- `enum class` — стани LED і режими роботи;
+- без динамічної пам'яті та STL-контейнерів.
 
 ### Формат виводу в Serial Monitor
 ```
 Ready. Mode: Blink
-loop: avg <X> us | min <Y> us | max <Z> us (1000 iterations)
-Button -> mode: Always ON
-Button -> mode: Always OFF
-Button -> mode: Blink
+Average loop time: <X> us
+Mode: Always ON
+Mode: Always OFF
+Mode: Blink
 ```
 
 ## Попередні завдання (`homework/`)
