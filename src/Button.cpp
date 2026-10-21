@@ -1,48 +1,46 @@
 #include "Button.h"
-#include "config.h"
-#include <Arduino.h>
+#include "Config.h"
+
+volatile bool Button::pressedFlag_ = false;
+
+void IRAM_ATTR Button::isr()
+{
+    // Мінімальний ISR: без Serial, без затримок, без логіки
+    pressedFlag_ = true;
+}
 
 void Button::init()
 {
-    // Внутрішня підтяжка до 3.3 В: у спокої HIGH, натиснуто (замкнуто на GND) — LOW
-    pinMode(BTN, INPUT_PULLUP);
+    // Внутрішня підтяжка: у спокої HIGH, натиснуто (замкнуто на GND) — LOW
+    pinMode(pin_, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(pin_), isr, FALLING);
 }
 
-void Button::poll()
+bool Button::poll(uint32_t nowMs)
 {
-    if (millis() - lastTimeChangeBtn > BTN_PERIOD_MS) // періодична перевірка стану кнопки
+    const bool isPressed = digitalRead(pin_) == LOW;
+
+    // «Озброюємо» кнопку, лише коли вона стабільно відпущена kDebounceMs.
+    // Так відсікаються і брязкіт при натисканні, і хибні FALLING при відпусканні.
+    if (isPressed)
     {
-        lastTimeChangeBtn = millis();
-        bool pressed = digitalRead(BTN) == LOW;
-
-        if (pressed)
-        {
-            if (btnTimekeeper == 0)
-            {
-                btnTimekeeper = millis(); // натискання щойно почалось — запам'ятовуємо час
-            }
-            else if (!longPressFired && millis() - btnTimekeeper > BTN_LONG_PRESS_MS)
-            {
-                longPressFired = true; // реальне тривале затискання — одна подія
-                longPressEvent = true;
-                Serial.println("BTN: long press -> event");
-            }
-        }
-        else if (btnTimekeeper != 0)
-        {
-            // Кнопку відпущено — друкуємо тривалість, щоб звірити з логічним аналізатором
-            u32_t duration = millis() - btnTimekeeper;
-            Serial.printf("BTN: released after %u ms (%s)\n", duration,
-                          longPressFired ? "real press" : "short / noise, ignored");
-            btnTimekeeper = 0;
-            longPressFired = false;
-        }
+        releasedSinceMs_ = nowMs;
     }
-}
+    else if (!armed_ && nowMs - releasedSinceMs_ >= Config::kDebounceMs)
+    {
+        armed_ = true;
+    }
 
-bool Button::get_long_press()
-{
-    bool event = longPressEvent;
-    longPressEvent = false;
-    return event;
+    if (!pressedFlag_)
+    {
+        return false;
+    }
+    pressedFlag_ = false; // bool пишеться атомарно, критична секція не потрібна
+
+    if (armed_ && isPressed)
+    {
+        armed_ = false;
+        return true;
+    }
+    return false; // брязкіт або імпульс уже відпущеної кнопки
 }

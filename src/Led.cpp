@@ -3,21 +3,17 @@
 
 void Led::init()
 {
-    pinMode(pin, OUTPUT); // налаштовуємо пін на ВИХІД (led)
+    pinMode(pin_, OUTPUT);
+    set(LedState::Off);
 }
 
-void Led::handler(bool light_on)
+void Led::set(LedState state)
 {
-    state = light_on;
-    digitalWrite(pin, state ? HIGH : LOW);
+    state_ = state;
+    digitalWrite(pin_, state_ == LedState::On ? HIGH : LOW);
 }
 
-void Led::blink(u32_t halfPeriodMs)
+void Led::toggle()
 {
-    // Меандр 50/50: перемикаємо стан кожні halfPeriodMs без delay()
-    if (millis() - lastToggle >= halfPeriodMs)
-    {
-        lastToggle = millis();
-        handler(!state);
-    }
+    set(state_ == LedState::On ? LedState::Off : LedState::On);
 }

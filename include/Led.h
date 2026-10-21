@@ -1,17 +1,25 @@
 #pragma once
 
-#include <Arduino.h>
+#include <cstdint>
+
+// Стан світлодіода: типобезпечно, не змішується з int чи bool
+enum class LedState : uint8_t
+{
+    Off,
+    On
+};
 
 class Led
 {
-private:
-    u8_t pin;
-    bool state = false;
-    u32_t lastToggle = 0;
-
 public:
-    Led(u8_t pin) : pin(pin) {}
+    explicit constexpr Led(uint8_t pin) : pin_(pin) {}
+
     void init();
-    void handler(bool light_on);    // просто увімкнути / вимкнути
-    void blink(u32_t halfPeriodMs); // неблокуюче блимання, викликати в кожному loop()
+    void set(LedState state);
+    void toggle();
+    LedState state() const { return state_; }
+
+private:
+    const uint8_t pin_;
+    LedState state_ = LedState::Off;
 };
