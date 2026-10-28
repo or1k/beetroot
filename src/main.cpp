@@ -1,270 +1,125 @@
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 
-// ДЗ 2.4: Усунення брязкоту контактів кнопки.
-// Усі 4 методи в одній програмі. Метод перемикається командою в Serial Monitor:
-//   1 — без debounce (кожен interrupt = реакція)
-//   2 — time-based: ігноруємо події, якщо з попередньої реакції пройшло < 50 мс
-//   3 — state-based: приймаємо подію, лише якщо кнопка досі натиснута
-//   4 — polling: без переривань, опитування кожні 5 мс + машина станів
-//   r — обнулити лічильники
-// На кожну реакцію LED перемикається і в лог пишеться номер реакції та затримка.
+// ДЗ 2.5: Таймери. Витяжний вентилятор вмикається кожну годину на 15 хвилин.
+// Цикл повністю веде апаратний таймер: його переривання раз на TICK_MS
+// саме вмикає і вимикає вентилятор. loop() лише друкує лог і скидає watchdog.
 //
-// Кнопка: GPIO7 -> кнопка -> GND, підтяжка 10 кОм від GPIO7 до 3V3.
+// Вентилятор = модуль реле (через транзистор 2N2222, як у ДЗ з реле) на GPIO17.
+// LED на GPIO4 горить, коли вентилятор працює; LED на GPIO5 — коли вимкнений.
 
-#define BUTTON_PIN 7
-#define LED_PIN 4
+#define FAN_PIN 17
+#define LED_ON_PIN 4  // зелений: вентилятор працює
+#define LED_OFF_PIN 5 // червоний: вентилятор вимкнений
 
-constexpr u32_t DEBOUNCE_MS = 50; // метод 2: мінімальний час між реакціями
-constexpr u32_t CONFIRM_MS = 10;  // метод 3: через скільки після події перевіряти, чи кнопка ще натиснута
-constexpr u32_t RELEASE_MS = 50;  // метод 3: скільки кнопка має бути відпущена, щоб прийняти нове натискання
-constexpr u32_t POLL_MS = 5;      // метод 4: період опитування
-constexpr u32_t STABLE_MS = 20;   // метод 4: скільки рівень має бути стабільним
+// 1 — режим налагодження: "година" = 8 с, "15 хвилин" = 2 с (та сама пропорція 1/4)
+#define DEBUG_MODE 1
 
-// ---------- Змінні переривання ----------
-volatile u32_t interruptCount = 0;  // всього interrupt (включно з брязкотом)
-volatile bool buttonEvent = false;  // ISR лише сигналізує "подія"
-volatile u32_t eventTimeUs = 0;     // час першого interrupt у пачці (для затримки)
+#if DEBUG_MODE
+#define FAN_PERIOD_MS 8000UL // як часто вмикати
+#define FAN_ON_MS 2000UL     // скільки працювати
+#else
+#define FAN_PERIOD_MS (60UL * 60UL * 1000UL) // 1 година
+#define FAN_ON_MS (15UL * 60UL * 1000UL)     // 15 хвилин
+#endif
 
-void IRAM_ATTR buttonISR()
+#define TICK_MS 100UL        // таймер спрацьовує кожні 100 мс
+#define WDT_TIMEOUT_S 5      // якщо loop() зависне на 5 с — плата перезавантажиться
+
+// Захист від помилки в налаштуваннях: час роботи має бути меншим за період
+static_assert(FAN_ON_MS < FAN_PERIOD_MS, "FAN_ON_MS must be less than FAN_PERIOD_MS");
+
+constexpr u32_t PERIOD_TICKS = FAN_PERIOD_MS / TICK_MS;
+constexpr u32_t ON_TICKS = FAN_ON_MS / TICK_MS;
+
+hw_timer_t *timer = nullptr;
+
+// Змінні, які змінює переривання таймера — volatile
+volatile u32_t tick = 0;           // номер тіку всередині періоду: 0 .. PERIOD_TICKS-1
+volatile bool fanOn = false;
+volatile bool stateChanged = false; // прапорець для логу в loop()
+volatile u32_t blockedStarts = 0;   // скільки разів захист не дав запустити вдруге
+
+// Вмикаємо/вимикаємо виходи через регістри (як на уроці про бітові операції) — швидко і безпечно в ISR
+void IRAM_ATTR setFan(bool on)
 {
-  interruptCount++;
-  if (!buttonEvent)
+  if (on)
   {
-    eventTimeUs = micros();
-    buttonEvent = true;
-  }
-}
-
-// ---------- Загальне ----------
-u8_t method = 1;
-u32_t reactions = 0; // скільки разів програма "зреагувала" на кнопку
-bool ledOn = false;
-
-// Реакція на натискання: лічильник, LED, лог із затримкою від першого фронту
-void react(u32_t firstEdgeUs)
-{
-  reactions++;
-  ledOn = !ledOn;
-  digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
-  Serial.printf("[method %u] reaction #%u | interrupts: %u | delay: %.2f ms\n",
-                method, reactions, interruptCount, (micros() - firstEdgeUs) / 1000.0);
-}
-
-// ---------- Метод 1: без debounce ----------
-// Кожен interrupt = реакція. Просто виводимо лічильник, щойно він змінився.
-u32_t shownCount = 0;
-
-void methodNoDebounce()
-{
-  if (interruptCount != shownCount)
-  {
-    shownCount = interruptCount;
-    reactions = shownCount;
-    buttonEvent = false;
-    Serial.printf("[method 1] interrupt counter: %u\n", shownCount);
-  }
-}
-
-// ---------- Метод 2: time-based (поза ISR) ----------
-void methodTimeBased(u32_t now)
-{
-  static u32_t lastReactionTime = 0;
-
-  if (buttonEvent)
-  {
-    buttonEvent = false;
-    if (now - lastReactionTime >= DEBOUNCE_MS)
-    {
-      lastReactionTime = now;
-      react(eventTimeUs);
-    }
-  }
-}
-
-// ---------- Метод 3: state-based ----------
-void methodStateBased(u32_t now)
-{
-  static bool waitingConfirm = false; // подія прийшла, чекаємо CONFIRM_MS
-  static u32_t confirmStart = 0;
-  static bool armed = true;           // кнопку було відпущено — можна приймати нове натискання
-  static u32_t lastTimePressed = 0;
-
-  bool pressed = digitalRead(BUTTON_PIN) == LOW;
-
-  // Нове натискання приймаємо лише після того, як кнопка була відпущена RELEASE_MS
-  if (pressed)
-  {
-    lastTimePressed = now;
-  }
-  else if (!armed && now - lastTimePressed >= RELEASE_MS)
-  {
-    armed = true;
-  }
-
-  if (buttonEvent && !waitingConfirm)
-  {
-    buttonEvent = false;
-    waitingConfirm = true;
-    confirmStart = now;
-  }
-
-  if (waitingConfirm && now - confirmStart >= CONFIRM_MS)
-  {
-    waitingConfirm = false;
-    buttonEvent = false; // брязкіт за час очікування нас не цікавить
-
-    // Кнопка досі натиснута -> справжнє натискання. Відпущена -> це брязкіт при відпусканні.
-    if (pressed && armed)
-    {
-      armed = false;
-      react(eventTimeUs);
-    }
-  }
-}
-
-// ---------- Метод 4: polling + машина станів (без interrupt) ----------
-enum PollState
-{
-  RELEASED,       // кнопка відпущена
-  MAYBE_PRESSED,  // побачили LOW, чекаємо, чи він стабільний
-  PRESSED,        // кнопка натиснута
-  MAYBE_RELEASED  // побачили HIGH, чекаємо, чи він стабільний
-};
-
-void methodPolling(u32_t now)
-{
-  static PollState state = RELEASED;
-  static u32_t lastPollTime = 0;
-  static u32_t stateStart = 0;
-  static u32_t firstLowUs = 0;
-
-  if (now - lastPollTime < POLL_MS)
-  {
-    return;
-  }
-  lastPollTime = now;
-
-  bool pressed = digitalRead(BUTTON_PIN) == LOW;
-
-  switch (state)
-  {
-  case RELEASED:
-    if (pressed)
-    {
-      state = MAYBE_PRESSED;
-      stateStart = now;
-      firstLowUs = micros();
-    }
-    break;
-
-  case MAYBE_PRESSED:
-    if (!pressed)
-    {
-      state = RELEASED; // це був брязкіт або завада
-    }
-    else if (now - stateStart >= STABLE_MS)
-    {
-      state = PRESSED;
-      react(firstLowUs);
-    }
-    break;
-
-  case PRESSED:
-    if (!pressed)
-    {
-      state = MAYBE_RELEASED;
-      stateStart = now;
-    }
-    break;
-
-  case MAYBE_RELEASED:
-    if (pressed)
-    {
-      state = PRESSED; // брязкіт при відпусканні
-    }
-    else if (now - stateStart >= STABLE_MS)
-    {
-      state = RELEASED;
-    }
-    break;
-  }
-}
-
-// ---------- Команди з Serial ----------
-void setMethod(u8_t newMethod)
-{
-  method = newMethod;
-  reactions = 0;
-  interruptCount = 0;
-  shownCount = 0;
-  buttonEvent = false;
-
-  if (method == 4)
-  {
-    detachInterrupt(digitalPinToInterrupt(BUTTON_PIN)); // polling — переривань немає зовсім
+    GPIO.out_w1ts = (1UL << FAN_PIN) | (1UL << LED_ON_PIN); // встановити біти — HIGH
+    GPIO.out_w1tc = (1UL << LED_OFF_PIN);                   // скинути біт — LOW
   }
   else
   {
-    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
+    GPIO.out_w1tc = (1UL << FAN_PIN) | (1UL << LED_ON_PIN);
+    GPIO.out_w1ts = (1UL << LED_OFF_PIN);
   }
-
-  const char *names[] = {"", "no debounce", "time-based", "state-based", "polling"};
-  Serial.printf("\n=== Method %u: %s ===\n", method, names[method]);
+  fanOn = on;
+  stateChanged = true;
 }
 
-void handleSerial()
+// Переривання таймера кожні TICK_MS. Саме воно веде весь цикл вентилятора.
+void IRAM_ATTR onTimer()
 {
-  if (Serial.available())
+  if (tick == 0)
   {
-    String cmd = Serial.readStringUntil('\n');
-    cmd.trim();
-
-    if (cmd == "1" || cmd == "2" || cmd == "3" || cmd == "4")
+    if (fanOn)
     {
-      setMethod(cmd.toInt());
-    }
-    else if (cmd == "r")
-    {
-      setMethod(method);
+      blockedStarts++; // захист від повторного запуску: вентилятор уже працює
     }
     else
     {
-      Serial.println("commands: 1 / 2 / 3 / 4 (method), r (reset counters)");
+      setFan(true);
     }
+  }
+  else if (tick == ON_TICKS && fanOn)
+  {
+    setFan(false);
+  }
+
+  tick++;
+  if (tick >= PERIOD_TICKS)
+  {
+    tick = 0; // новий період — цикл повторюється сам
   }
 }
 
 void setup()
 {
   Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-  // Тільки зовнішня підтяжка 10 кОм (за завданням). Внутрішню INPUT_PULLUP не вмикаємо:
-  // з RC-фільтром вона утворює дільник із послідовним резистором і "підвішує" рівень на піні.
-  pinMode(BUTTON_PIN, INPUT);
-  Serial.println("Debounce test. Commands: 1 / 2 / 3 / 4 (method), r (reset counters)");
-  setMethod(1);
+
+  pinMode(FAN_PIN, OUTPUT);
+  pinMode(LED_ON_PIN, OUTPUT);
+  pinMode(LED_OFF_PIN, OUTPUT);
+  setFan(false);
+
+  // Watchdog: якщо loop() перестане його скидати — перезавантаження
+  esp_task_wdt_init(WDT_TIMEOUT_S, true);
+  esp_task_wdt_add(NULL);
+
+  // Апаратний таймер: дільник 80 -> 1 МГц (1 тік = 1 мкс), переривання кожні TICK_MS
+  timer = timerBegin(0, 80, true);
+  timerAttachInterrupt(timer, &onTimer, true);
+  timerAlarmWrite(timer, TICK_MS * 1000, true); // true — автоповтор
+  timerAlarmEnable(timer);
+
+  Serial.printf("Fan timer: period %lu ms, on %lu ms (%s)\n",
+                FAN_PERIOD_MS, FAN_ON_MS, DEBUG_MODE ? "debug" : "real");
 }
 
 void loop()
 {
-  u32_t now = millis();
+  // loop() НЕ керує вентилятором — лише логує стан і скидає watchdog
+  if (stateChanged)
+  {
+    stateChanged = false;
+    Serial.printf("[%8lu ms] FAN %s\n", millis(), fanOn ? "ON" : "OFF");
+  }
 
-  handleSerial();
+  if (blockedStarts > 0)
+  {
+    Serial.printf("Restart blocked %u time(s): fan was still running\n", blockedStarts);
+    blockedStarts = 0;
+  }
 
-  if (method == 1)
-  {
-    methodNoDebounce();
-  }
-  else if (method == 2)
-  {
-    methodTimeBased(now);
-  }
-  else if (method == 3)
-  {
-    methodStateBased(now);
-  }
-  else
-  {
-    methodPolling(now);
-  }
+  esp_task_wdt_reset();
 }
