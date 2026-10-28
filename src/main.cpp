@@ -1,101 +1,270 @@
 #include <Arduino.h>
 
-// ДЗ 2.3: Superloop та незалежні задачі.
-// Три світлодіоди блимають кожен зі своїм інтервалом в одному loop():
-//   LED1 — кожні 200 мс, LED2 — кожні 500 мс, LED3 — кожні 1000 мс.
-// Без delay() і без while для очікування: кожен LED сам перевіряє millis().
+// ДЗ 2.4: Усунення брязкоту контактів кнопки.
+// Усі 4 методи в одній програмі. Метод перемикається командою в Serial Monitor:
+//   1 — без debounce (кожен interrupt = реакція)
+//   2 — time-based: ігноруємо події, якщо з попередньої реакції пройшло < 50 мс
+//   3 — state-based: приймаємо подію, лише якщо кнопка досі натиснута
+//   4 — polling: без переривань, опитування кожні 5 мс + машина станів
+//   r — обнулити лічильники
+// На кожну реакцію LED перемикається і в лог пишеться номер реакції та затримка.
+//
+// Кнопка: GPIO7 -> кнопка -> GND, підтяжка 10 кОм від GPIO7 до 3V3.
 
-#define LED1_PIN 4
-#define LED2_PIN 5
-#define LED3_PIN 6
+#define BUTTON_PIN 7
+#define LED_PIN 4
 
-constexpr u32_t LED1_INTERVAL_MS = 200;
-constexpr u32_t LED2_INTERVAL_MS = 500;
-constexpr u32_t LED3_INTERVAL_MS = 1000;
-constexpr u32_t REPORT_INTERVAL_MS = 1000; // як часто друкувати статистику в Serial
+constexpr u32_t DEBOUNCE_MS = 50; // метод 2: мінімальний час між реакціями
+constexpr u32_t CONFIRM_MS = 10;  // метод 3: через скільки після події перевіряти, чи кнопка ще натиснута
+constexpr u32_t RELEASE_MS = 50;  // метод 3: скільки кнопка має бути відпущена, щоб прийняти нове натискання
+constexpr u32_t POLL_MS = 5;      // метод 4: період опитування
+constexpr u32_t STABLE_MS = 20;   // метод 4: скільки рівень має бути стабільним
 
-// Світлодіод, який сам знає свій пін, інтервал і коли перемикався востаннє
-class BlinkingLed
+// ---------- Змінні переривання ----------
+volatile u32_t interruptCount = 0;  // всього interrupt (включно з брязкотом)
+volatile bool buttonEvent = false;  // ISR лише сигналізує "подія"
+volatile u32_t eventTimeUs = 0;     // час першого interrupt у пачці (для затримки)
+
+void IRAM_ATTR buttonISR()
 {
-private:
-  u8_t pin;
-  u32_t interval;
-  u32_t lastToggleTime = 0;
-  bool isOn = false;
-  u32_t toggles = 0; // скільки разів перемкнувся (для перевірки в Serial)
-
-public:
-  BlinkingLed(u8_t ledPin, u32_t intervalMs)
+  interruptCount++;
+  if (!buttonEvent)
   {
-    pin = ledPin;
-    interval = intervalMs;
+    eventTimeUs = micros();
+    buttonEvent = true;
   }
+}
 
-  void init()
+// ---------- Загальне ----------
+u8_t method = 1;
+u32_t reactions = 0; // скільки разів програма "зреагувала" на кнопку
+bool ledOn = false;
+
+// Реакція на натискання: лічильник, LED, лог із затримкою від першого фронту
+void react(u32_t firstEdgeUs)
+{
+  reactions++;
+  ledOn = !ledOn;
+  digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+  Serial.printf("[method %u] reaction #%u | interrupts: %u | delay: %.2f ms\n",
+                method, reactions, interruptCount, (micros() - firstEdgeUs) / 1000.0);
+}
+
+// ---------- Метод 1: без debounce ----------
+// Кожен interrupt = реакція. Просто виводимо лічильник, щойно він змінився.
+u32_t shownCount = 0;
+
+void methodNoDebounce()
+{
+  if (interruptCount != shownCount)
   {
-    pinMode(pin, OUTPUT);
-    digitalWrite(pin, LOW);
+    shownCount = interruptCount;
+    reactions = shownCount;
+    buttonEvent = false;
+    Serial.printf("[method 1] interrupt counter: %u\n", shownCount);
   }
+}
 
-  // Викликається в кожному проході loop(). Нічого не чекає: якщо час не настав — одразу виходить.
-  void update(u32_t now)
+// ---------- Метод 2: time-based (поза ISR) ----------
+void methodTimeBased(u32_t now)
+{
+  static u32_t lastReactionTime = 0;
+
+  if (buttonEvent)
   {
-    if (now - lastToggleTime >= interval)
+    buttonEvent = false;
+    if (now - lastReactionTime >= DEBOUNCE_MS)
     {
-      lastToggleTime = now;
-      isOn = !isOn;
-      digitalWrite(pin, isOn ? HIGH : LOW);
-      toggles++;
+      lastReactionTime = now;
+      react(eventTimeUs);
     }
   }
+}
 
-  // Повертає кількість перемикань з минулого виклику і обнуляє лічильник
-  u32_t takeToggles()
+// ---------- Метод 3: state-based ----------
+void methodStateBased(u32_t now)
+{
+  static bool waitingConfirm = false; // подія прийшла, чекаємо CONFIRM_MS
+  static u32_t confirmStart = 0;
+  static bool armed = true;           // кнопку було відпущено — можна приймати нове натискання
+  static u32_t lastTimePressed = 0;
+
+  bool pressed = digitalRead(BUTTON_PIN) == LOW;
+
+  // Нове натискання приймаємо лише після того, як кнопка була відпущена RELEASE_MS
+  if (pressed)
   {
-    u32_t count = toggles;
-    toggles = 0;
-    return count;
+    lastTimePressed = now;
   }
+  else if (!armed && now - lastTimePressed >= RELEASE_MS)
+  {
+    armed = true;
+  }
+
+  if (buttonEvent && !waitingConfirm)
+  {
+    buttonEvent = false;
+    waitingConfirm = true;
+    confirmStart = now;
+  }
+
+  if (waitingConfirm && now - confirmStart >= CONFIRM_MS)
+  {
+    waitingConfirm = false;
+    buttonEvent = false; // брязкіт за час очікування нас не цікавить
+
+    // Кнопка досі натиснута -> справжнє натискання. Відпущена -> це брязкіт при відпусканні.
+    if (pressed && armed)
+    {
+      armed = false;
+      react(eventTimeUs);
+    }
+  }
+}
+
+// ---------- Метод 4: polling + машина станів (без interrupt) ----------
+enum PollState
+{
+  RELEASED,       // кнопка відпущена
+  MAYBE_PRESSED,  // побачили LOW, чекаємо, чи він стабільний
+  PRESSED,        // кнопка натиснута
+  MAYBE_RELEASED  // побачили HIGH, чекаємо, чи він стабільний
 };
 
-BlinkingLed led1(LED1_PIN, LED1_INTERVAL_MS);
-BlinkingLed led2(LED2_PIN, LED2_INTERVAL_MS);
-BlinkingLed led3(LED3_PIN, LED3_INTERVAL_MS);
+void methodPolling(u32_t now)
+{
+  static PollState state = RELEASED;
+  static u32_t lastPollTime = 0;
+  static u32_t stateStart = 0;
+  static u32_t firstLowUs = 0;
+
+  if (now - lastPollTime < POLL_MS)
+  {
+    return;
+  }
+  lastPollTime = now;
+
+  bool pressed = digitalRead(BUTTON_PIN) == LOW;
+
+  switch (state)
+  {
+  case RELEASED:
+    if (pressed)
+    {
+      state = MAYBE_PRESSED;
+      stateStart = now;
+      firstLowUs = micros();
+    }
+    break;
+
+  case MAYBE_PRESSED:
+    if (!pressed)
+    {
+      state = RELEASED; // це був брязкіт або завада
+    }
+    else if (now - stateStart >= STABLE_MS)
+    {
+      state = PRESSED;
+      react(firstLowUs);
+    }
+    break;
+
+  case PRESSED:
+    if (!pressed)
+    {
+      state = MAYBE_RELEASED;
+      stateStart = now;
+    }
+    break;
+
+  case MAYBE_RELEASED:
+    if (pressed)
+    {
+      state = PRESSED; // брязкіт при відпусканні
+    }
+    else if (now - stateStart >= STABLE_MS)
+    {
+      state = RELEASED;
+    }
+    break;
+  }
+}
+
+// ---------- Команди з Serial ----------
+void setMethod(u8_t newMethod)
+{
+  method = newMethod;
+  reactions = 0;
+  interruptCount = 0;
+  shownCount = 0;
+  buttonEvent = false;
+
+  if (method == 4)
+  {
+    detachInterrupt(digitalPinToInterrupt(BUTTON_PIN)); // polling — переривань немає зовсім
+  }
+  else
+  {
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), buttonISR, FALLING);
+  }
+
+  const char *names[] = {"", "no debounce", "time-based", "state-based", "polling"};
+  Serial.printf("\n=== Method %u: %s ===\n", method, names[method]);
+}
+
+void handleSerial()
+{
+  if (Serial.available())
+  {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd == "1" || cmd == "2" || cmd == "3" || cmd == "4")
+    {
+      setMethod(cmd.toInt());
+    }
+    else if (cmd == "r")
+    {
+      setMethod(method);
+    }
+    else
+    {
+      Serial.println("commands: 1 / 2 / 3 / 4 (method), r (reset counters)");
+    }
+  }
+}
 
 void setup()
 {
   Serial.begin(115200);
-  led1.init();
-  led2.init();
-  led3.init();
-  Serial.println("Superloop: LED1 200 ms | LED2 500 ms | LED3 1000 ms");
+  pinMode(LED_PIN, OUTPUT);
+  // Тільки зовнішня підтяжка 10 кОм (за завданням). Внутрішню INPUT_PULLUP не вмикаємо:
+  // з RC-фільтром вона утворює дільник із послідовним резистором і "підвішує" рівень на піні.
+  pinMode(BUTTON_PIN, INPUT);
+  Serial.println("Debounce test. Commands: 1 / 2 / 3 / 4 (method), r (reset counters)");
+  setMethod(1);
 }
 
-// Звіт раз на секунду: скільки разів перемкнувся кожен LED.
-// Очікується 5 / 2 / 1 — це доводить, що задачі працюють незалежно.
-void report(u32_t now)
-{
-  static u32_t lastReportTime = 0;
-  static u32_t loopCount = 0;
-
-  loopCount++;
-
-  if (now - lastReportTime >= REPORT_INTERVAL_MS)
-  {
-    lastReportTime = now;
-    Serial.printf("t=%5u ms | LED1: %u | LED2: %u | LED3: %u toggles | loop ran %u times\n",
-                  now, led1.takeToggles(), led2.takeToggles(), led3.takeToggles(), loopCount);
-    loopCount = 0;
-  }
-}
-
-void loop() // superloop: кожна задача робить короткий крок і одразу повертає керування
+void loop()
 {
   u32_t now = millis();
 
-  led1.update(now);
-  led2.update(now);
-  led3.update(now);
+  handleSerial();
 
-  report(now);
+  if (method == 1)
+  {
+    methodNoDebounce();
+  }
+  else if (method == 2)
+  {
+    methodTimeBased(now);
+  }
+  else if (method == 3)
+  {
+    methodStateBased(now);
+  }
+  else
+  {
+    methodPolling(now);
+  }
 }
