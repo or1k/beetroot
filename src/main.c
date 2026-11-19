@@ -1,153 +1,286 @@
-// ДЗ 3.3: Широтно-імпульсна модуляція (PWM) — ESP-IDF.
-// Потенціометр керує яскравістю світлодіода і швидкістю двигуна.
+// ДЗ 3.4: Програвання звуку на зумері (PWM) — ESP-IDF.
+// Завдання 1: неблокуючий аудіо-плеєр:
+//   - звук через PWM (LEDC): частота ШІМ = частота ноти, заповнення 50 %;
+//   - фіксований часовий тік 50 мс від таймера esp_timer;
+//   - нічого не блокує: ні FreeRTOS task, ні delay. app_main лише налаштовує все і завершується,
+//     далі вся робота — у колбеку таймера.
+// Бонус (Завдання 2): кілька мелодій на 7 нотах, вибір командою з Serial Monitor.
+// Щоб показати, що програма не заблокована, від того ж тіку незалежно блимає LED.
 //
-// Щоб двигун і світлодіод не впливали одне на одного:
-//   - у кожного свій таймер LEDC і свій канал (різні частоти ШІМ);
-//   - двигун живиться від окремої плати живлення через транзистор, з діодом і конденсатором;
-//   - значення потенціометра згладжується SMA, щоб завади від двигуна не "смикали" яскравість.
-//
-// Схема:
-//   Потенціометр: 3V3 — повзунок на GPIO2 (ADC1_CH1) — GND
-//   LED:  GPIO4 -> 220 Ом -> LED -> GND
-//   Двигун: GPIO17 -> 220 Ом -> база 2N2222; емітер -> GND; колектор -> (−) двигуна;
-//           (+) двигуна -> +5 В плати живлення; діод паралельно двигуну смужкою до +; 100 мкФ між + і GND
+// Схема: GPIO5 -> (+) пасивного зумера, (−) зумера -> GND
+//        GPIO4 -> 220 Ом -> LED -> GND
 
 #include <stdio.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <stdbool.h>
 #include "driver/ledc.h"
-#include "esp_adc/adc_oneshot.h"
+#include "driver/uart.h"
+#include "esp_timer.h"
 
-#define POT_CHANNEL ADC_CHANNEL_1 // GPIO2
+#define BUZZER_PIN 5
 #define LED_PIN 4
-#define MOTOR_PIN 17
 
-// ---------- ШІМ ----------
-#define PWM_RESOLUTION LEDC_TIMER_10_BIT // заповнення 0..1023
-#define PWM_MAX_DUTY 1023
-#define LED_PWM_FREQ 5000    // 5 кГц — оку не видно мерехтіння
-#define MOTOR_PWM_FREQ 20000 // 20 кГц — двигун не "пищить" (вище за чутний діапазон)
+#define TICK_MS 50          // фіксований тік плеєра
+#define GAP_TICKS 1         // тиша між нотами (50 мс) — щоб однакові ноти не зливались
+#define LED_BLINK_TICKS 10  // LED перемикається кожні 10 тіків = 500 мс
 
-// ---------- Двигун ----------
-// Нижче MOTOR_START_PCT потенціометра двигун вимкнений (мертва зона, як у прикладі з уроку).
-// Вище — заповнення починається з MOTOR_MIN_DUTY: при меншому двигун гуде, але не крутиться.
-#define MOTOR_START_PCT 5
-#define MOTOR_MIN_DUTY 400
+#define PWM_RESOLUTION LEDC_TIMER_10_BIT
+#define DUTY_SOUND 512 // 50 % з 1023 — найгучніший звук для зумера
+#define DUTY_SILENT 0
 
-// ---------- ADC ----------
-#define ADC_MAX 4095
-#define SAMPLE_PERIOD_MS 20 // 50 разів на секунду
-#define SMA_WINDOW 8
-#define LOG_EVERY 10 // лог раз на 200 мс
+// ---------- Ноти (частоти першої октави, Гц) ----------
+#define NOTE_C 262
+#define NOTE_D 294
+#define NOTE_E 330
+#define NOTE_F 349
+#define NOTE_G 392
+#define NOTE_A 440
+#define NOTE_B 494
+#define REST 0 // пауза
 
-static uint16_t samples[SMA_WINDOW];
-static uint8_t sampleIndex = 0;
-static uint32_t sampleSum = 0;
-
-static void smaInit(uint16_t value)
+typedef struct
 {
-    for (int i = 0; i < SMA_WINDOW; i++)
+    uint16_t freq;  // частота ноти, Гц (0 — пауза)
+    uint8_t ticks;  // тривалість у тіках по 50 мс
+} Note;
+
+typedef struct
+{
+    const char *name;
+    const Note *notes;
+    uint8_t length;
+} Melody;
+
+// Тривалості: 4 тіки = 200 мс (коротка), 6 = 300 мс, 12 = 600 мс (довга)
+static const Note babyShark[] = {
+    {NOTE_C, 4}, {NOTE_D, 4}, {NOTE_E, 6}, {REST, 2},
+    {NOTE_C, 4}, {NOTE_D, 4}, {NOTE_E, 6}, {REST, 2},
+    {NOTE_C, 4}, {NOTE_D, 4}, {NOTE_E, 12}};
+
+static const Note jingleBells[] = {
+    {NOTE_E, 4}, {NOTE_E, 4}, {NOTE_E, 8},
+    {NOTE_E, 4}, {NOTE_E, 4}, {NOTE_E, 8},
+    {NOTE_E, 4}, {NOTE_G, 4}, {NOTE_C, 6}, {NOTE_D, 2}, {NOTE_E, 12}};
+
+static const Note rockYou[] = {
+    {NOTE_C, 4}, {NOTE_C, 4}, {NOTE_D, 6}, {REST, 2},
+    {NOTE_C, 4}, {NOTE_C, 4}, {NOTE_D, 6}, {REST, 2},
+    {NOTE_C, 4}, {NOTE_C, 4}, {NOTE_D, 4}, {NOTE_E, 12}};
+
+static const Note twinkle[] = {
+    {NOTE_C, 6}, {NOTE_C, 6}, {NOTE_G, 6}, {NOTE_G, 6},
+    {NOTE_A, 6}, {NOTE_A, 6}, {NOTE_G, 12}};
+
+static const Note macDonald[] = {
+    {NOTE_G, 6}, {NOTE_G, 6}, {NOTE_G, 6}, {NOTE_D, 6},
+    {NOTE_E, 6}, {NOTE_E, 6}, {NOTE_D, 12}};
+
+// Мелодія з уроку (гілка PFM): там вона грається блокуюче через HAL_Delay(400/800),
+// тут — та сама мелодія і ті самі тривалості, але на тіках (8 тіків = 400 мс, 16 = 800 мс)
+static const Note twinkleLesson[] = {
+    {NOTE_C, 8}, {NOTE_C, 8}, {NOTE_G, 8}, {NOTE_G, 8}, {NOTE_A, 8}, {NOTE_A, 8}, {NOTE_G, 16},
+    {NOTE_F, 8}, {NOTE_F, 8}, {NOTE_E, 8}, {NOTE_E, 8}, {NOTE_D, 8}, {NOTE_D, 8}, {NOTE_C, 16}};
+
+#define LEN(a) (sizeof(a) / sizeof(a[0]))
+
+static const Melody melodies[] = {
+    {"Baby Shark", babyShark, LEN(babyShark)},
+    {"Jingle Bells", jingleBells, LEN(jingleBells)},
+    {"We Will Rock You", rockYou, LEN(rockYou)},
+    {"Twinkle Twinkle Little Star", twinkle, LEN(twinkle)},
+    {"Old MacDonald", macDonald, LEN(macDonald)},
+    {"Twinkle Twinkle (full, from lesson)", twinkleLesson, LEN(twinkleLesson)},
+};
+#define MELODY_COUNT LEN(melodies)
+
+// ---------- Плеєр: машина станів ----------
+typedef enum
+{
+    PLAYER_IDLE, // нічого не грає
+    PLAYER_NOTE, // звучить нота
+    PLAYER_GAP   // коротка тиша між нотами
+} PlayerState;
+
+static PlayerState state = PLAYER_IDLE;
+static const Melody *current = NULL;
+static uint8_t noteIndex = 0;
+static uint8_t ticksLeft = 0;
+
+static void buzzerSet(uint16_t freq)
+{
+    if (freq == REST)
     {
-        samples[i] = value;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, DUTY_SILENT);
     }
-    sampleSum = (uint32_t)value * SMA_WINDOW;
-}
-
-static uint16_t smaUpdate(uint16_t value)
-{
-    sampleSum -= samples[sampleIndex];
-    sampleSum += value;
-    samples[sampleIndex] = value;
-    sampleIndex = (sampleIndex + 1) % SMA_WINDOW;
-    return sampleSum / SMA_WINDOW;
-}
-
-// Налаштувати окремий таймер і канал LEDC для одного виходу
-static void pwmInit(ledc_timer_t timer, ledc_channel_t channel, int pin, uint32_t freq)
-{
-    ledc_timer_config_t timerConfig = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .duty_resolution = PWM_RESOLUTION,
-        .timer_num = timer,
-        .freq_hz = freq,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    ledc_timer_config(&timerConfig);
-
-    ledc_channel_config_t channelConfig = {
-        .gpio_num = pin,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = channel,
-        .timer_sel = timer,
-        .duty = 0,
-        .hpoint = 0,
-    };
-    ledc_channel_config(&channelConfig);
-}
-
-static void pwmSet(ledc_channel_t channel, uint32_t duty)
-{
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, channel, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, channel);
-}
-
-// Потенціометр (0..4095) -> заповнення двигуна з мертвою зоною і мінімальним стартовим заповненням
-static uint32_t motorDutyFromPot(uint16_t pot)
-{
-    uint32_t percent = (uint32_t)pot * 100 / ADC_MAX;
-    if (percent < MOTOR_START_PCT)
+    else
     {
-        return 0;
+        ledc_set_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0, freq); // висота звуку = частота ШІМ
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, DUTY_SOUND);
     }
-    return MOTOR_MIN_DUTY + (uint32_t)(PWM_MAX_DUTY - MOTOR_MIN_DUTY) * (percent - MOTOR_START_PCT) / (100 - MOTOR_START_PCT);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+}
+
+static void startNote(void)
+{
+    const Note *note = &current->notes[noteIndex];
+    buzzerSet(note->freq);
+    ticksLeft = note->ticks;
+    state = PLAYER_NOTE;
+}
+
+static void playerPlay(uint8_t melodyNumber)
+{
+    current = &melodies[melodyNumber];
+    noteIndex = 0;
+    printf("Playing: %s\n", current->name);
+    startNote();
+}
+
+static void playerStop(void)
+{
+    buzzerSet(REST);
+    state = PLAYER_IDLE;
+}
+
+// Викликається кожен тік (50 мс): лише рахує тіки і перемикає стан — нічого не чекає
+static void playerTick(void)
+{
+    if (state == PLAYER_IDLE)
+    {
+        return;
+    }
+
+    if (ticksLeft > 0)
+    {
+        ticksLeft--;
+    }
+    if (ticksLeft > 0)
+    {
+        return; // поточна нота / пауза ще триває
+    }
+
+    if (state == PLAYER_NOTE)
+    {
+        buzzerSet(REST); // нота закінчилась — коротка тиша
+        ticksLeft = GAP_TICKS;
+        state = PLAYER_GAP;
+    }
+    else // PLAYER_GAP
+    {
+        noteIndex++;
+        if (noteIndex >= current->length)
+        {
+            playerStop();
+            printf("Done: %s\n", current->name);
+        }
+        else
+        {
+            startNote();
+        }
+    }
+}
+
+// ---------- Команди з Serial (без очікування: читаємо лише те, що вже прийшло) ----------
+static void handleSerial(void)
+{
+    uint8_t c;
+    while (uart_read_bytes(UART_NUM_0, &c, 1, 0) == 1) // таймаут 0 — не блокує
+    {
+        if (c >= '1' && c < '1' + MELODY_COUNT)
+        {
+            playerPlay(c - '1');
+        }
+        else if (c == 's')
+        {
+            playerStop();
+            printf("Stopped\n");
+        }
+        else if (c != '\n' && c != '\r')
+        {
+            printf("Commands: 1..%d - melody, s - stop\n", (int)MELODY_COUNT);
+        }
+    }
+}
+
+// ---------- LED: незалежна "друга задача" на тому ж тіку ----------
+static void ledTick(void)
+{
+    static uint8_t counter = 0;
+    static bool on = false;
+
+    if (++counter >= LED_BLINK_TICKS)
+    {
+        counter = 0;
+        on = !on;
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, on ? 1023 : 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    }
+}
+
+// Колбек таймера — кожні 50 мс
+static void onTick(void *arg)
+{
+    handleSerial();
+    playerTick();
+    ledTick();
 }
 
 void app_main(void)
 {
-    // Два незалежні ШІМ: свій таймер і канал для LED і для двигуна
-    pwmInit(LEDC_TIMER_0, LEDC_CHANNEL_0, LED_PIN, LED_PWM_FREQ);
-    pwmInit(LEDC_TIMER_1, LEDC_CHANNEL_1, MOTOR_PIN, MOTOR_PWM_FREQ);
+    uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0);
 
-    // ADC1 oneshot для потенціометра
-    adc_oneshot_unit_handle_t adc;
-    adc_oneshot_unit_init_cfg_t unitConfig = {.unit_id = ADC_UNIT_1};
-    adc_oneshot_new_unit(&unitConfig, &adc);
-    adc_oneshot_chan_cfg_t channelConfig = {
-        .bitwidth = ADC_BITWIDTH_12,
-        .atten = ADC_ATTEN_DB_12,
+    // Зумер: таймер 0, частота змінюється для кожної ноти
+    ledc_timer_config_t buzzerTimer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = PWM_RESOLUTION,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = NOTE_C,
+        .clk_cfg = LEDC_AUTO_CLK,
     };
-    adc_oneshot_config_channel(adc, POT_CHANNEL, &channelConfig);
+    ledc_timer_config(&buzzerTimer);
+    ledc_channel_config_t buzzerChannel = {
+        .gpio_num = BUZZER_PIN,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = DUTY_SILENT,
+    };
+    ledc_channel_config(&buzzerChannel);
 
-    int raw = 0;
-    adc_oneshot_read(adc, POT_CHANNEL, &raw);
-    smaInit(raw);
+    // LED: свій таймер 1 (5 кГц), щоб зміна частоти зумера його не чіпала
+    ledc_timer_config_t ledTimer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = PWM_RESOLUTION,
+        .timer_num = LEDC_TIMER_1,
+        .freq_hz = 5000,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&ledTimer);
+    ledc_channel_config_t ledChannel = {
+        .gpio_num = LED_PIN,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_1,
+        .timer_sel = LEDC_TIMER_1,
+        .duty = 0,
+    };
+    ledc_channel_config(&ledChannel);
 
-    printf("PWM: LED %d Hz (timer 0), motor %d Hz (timer 1), resolution 10 bit (0..%d)\n",
-           LED_PWM_FREQ, MOTOR_PWM_FREQ, PWM_MAX_DUTY);
+    // Фіксований тік 50 мс
+    esp_timer_handle_t tickTimer;
+    esp_timer_create_args_t tickArgs = {
+        .callback = onTick,
+        .name = "player_tick",
+    };
+    esp_timer_create(&tickArgs, &tickTimer);
+    esp_timer_start_periodic(tickTimer, TICK_MS * 1000);
 
-    int counter = 0;
-    TickType_t lastWake = xTaskGetTickCount();
-
-    while (1)
+    printf("Buzzer player. Tick %d ms. Commands:\n", TICK_MS);
+    for (int i = 0; i < (int)MELODY_COUNT; i++)
     {
-        adc_oneshot_read(adc, POT_CHANNEL, &raw);
-        uint16_t pot = smaUpdate(raw);
-
-        uint32_t ledDuty = (uint32_t)pot * PWM_MAX_DUTY / ADC_MAX; // яскравість: лінійно 0..100 %
-        uint32_t motorDuty = motorDutyFromPot(pot);
-
-        pwmSet(LEDC_CHANNEL_0, ledDuty);
-        pwmSet(LEDC_CHANNEL_1, motorDuty);
-
-        if (++counter >= LOG_EVERY)
-        {
-            counter = 0;
-            printf("pot: %4u (%3lu %%) | LED duty: %4lu (%3lu %%) | motor duty: %4lu (%3lu %%)\n",
-                   pot, (unsigned long)(pot * 100UL / ADC_MAX),
-                   (unsigned long)ledDuty, (unsigned long)(ledDuty * 100 / PWM_MAX_DUTY),
-                   (unsigned long)motorDuty, (unsigned long)(motorDuty * 100 / PWM_MAX_DUTY));
-        }
-
-        vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(SAMPLE_PERIOD_MS));
+        printf("  %d - %s\n", i + 1, melodies[i].name);
     }
+    printf("  s - stop\n");
+
+    playerPlay(0); // одразу програти першу мелодію
+
+    // app_main завершується — програма працює далі лише на таймері
 }
