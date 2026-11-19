@@ -36,6 +36,33 @@ PlatformIO-проєкт для ESP32-S3 DevKitC-1.
 | LED | GPIO4 → 220 Ом → LED → GND |
 
 ### Результат
+Serial Monitor:
+```
+I (279) main_task: Calling app_main()
+Buzzer player. Tick 50 ms. Commands:
+  1 - Baby Shark
+  2 - Jingle Bells
+  3 - We Will Rock You
+  4 - Twinkle Twinkle Little Star
+  5 - Old MacDonald
+  6 - Twinkle Twinkle (full, from lesson)
+  s - stop
+Playing: Baby Shark
+I (292) main_task: Returned from app_main()
+Done: Baby Shark
+2
+Playing: Jingle Bells
+Done: Jingle Bells
+3
+Playing: We Will Rock You
+Done: We Will Rock You
+4
+Playing: Twinkle Twinkle Little Star
+Done: Twinkle Twinkle Little Star
+```
+`Returned from app_main()` з'являється **до** `Done: Baby Shark`: `app_main` уже завершився, а мелодія доігрує лише від таймера —
+жодної власної задачі FreeRTOS і жодного `delay`.
+
 Перевірено на платі ESP32-S3 з модулем пасивного зумера:
 - після старту одразу грає Baby Shark, команди `1`–`6` у Serial Monitor перемикають мелодії, `s` миттєво зупиняє звук;
 - під час програвання LED рівно блимає кожні 500 мс — програма не блокується, хоча мелодія триває кілька секунд;
